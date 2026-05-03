@@ -441,18 +441,45 @@ async def _call_agelia(method: str, path: str, request: Request,
                        body: dict = None) -> tuple[dict, int]:
     """Forward an analyst action to Agelia, propagating the Keycloak JWT.
 
+    Two auth modes:
+      1. JWT-forward (default): caller has Authorization: Bearer header from
+         a real Keycloak SSO session. Forward as-is to Agelia which validates
+         the JWT and uses preferred_username as the audit actor.
+      2. Iframe-bridge: caller is the Wazuh-dashboard-embedded Pallas iframe.
+         No raw Keycloak JWT is available to the iframe (OSD security plugin
+         doesn't expose it), but the parent posted the username via
+         postMessage and the frontend sends it as X-Pallas-Iframe-User.
+         Fall back to the shared integration key + forward the iframe-user
+         header so Agelia can record the claimed actor in its audit row.
+         (Agelia still verifies trust of the integration key, and the iframe
+         user header is recorded as a *claim* — not a verified identity —
+         which is the correct semantic for a perimeter-trusted intermediary.)
+
     Returns (response_dict, status_code). Never raises — caller decides how to
     surface errors.
     """
     if not AGELIA_BASE_URL:
         return {"error": "Agelia integration not configured (AGELIA_BASE_URL missing)"}, 503
-    analyst_token = request.headers.get("Authorization", "")
+    analyst_token   = request.headers.get("Authorization", "")
+    iframe_user     = request.headers.get("X-Pallas-Iframe-User", "").strip()
     headers = {
         "Content-Type": "application/json",
         "X-Initiated-From": "pallas",
     }
     if analyst_token:
         headers["Authorization"] = analyst_token
+    elif iframe_user and AGELIA_API_KEY:
+        # Iframe-bridge mode: no per-user JWT available. Use the shared
+        # machine-to-machine integration key and forward the claimed actor
+        # so Agelia can log it (Agelia is responsible for deciding whether
+        # to honor the claim or treat it as a service-account action).
+        headers["X-Integration-Key"]      = AGELIA_API_KEY
+        headers["X-Pallas-Iframe-User"]   = iframe_user
+        headers["X-Initiated-From"]       = "pallas-iframe"
+        logger.info(
+            "Agelia iframe-bridge call %s %s claimed_user=%s",
+            method, path, iframe_user,
+        )
     try:
         client = _get_agelia_client()
         resp = await client.request(
@@ -4322,6 +4349,93 @@ async def get_integration_status(request: Request):
         "jira": jira_client_instance.is_configured,
         "agelia_blocking": agelia_blocking_configured,
         "incident_store": True,  # Always available (uses existing OpenSearch)
+    })
+
+
+@router.post("/api/narrative/incident/close-with-disposition")
+async def close_with_disposition(request: Request):
+    """Close an incident with an explicit categorical disposition + analyst notes.
+
+    Used by Pallas Mode B (no-Jira deployments) where the analyst is the only
+    party who closes incidents. The disposition becomes part of the audit
+    record so SOC reporting can split closures by category (Resolved /
+    False Positive / Benign / Other).
+
+    For tenants that have Jira, the standard /close endpoint is preferred —
+    closure is normally engineer-driven via Jira webhook (Phase 2).
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(content={"error": "Invalid JSON"}, status_code=400)
+
+    alert_id    = body.get("alert_id", "").strip()
+    disposition = (body.get("disposition") or "").strip().lower()
+    notes       = (body.get("notes") or "").strip()
+    analyst     = body.get("analyst_name", "SOC Analyst")
+
+    valid_dispositions = {"resolved", "false_positive", "benign", "other"}
+    if not alert_id:
+        return JSONResponse(content={"error": "Missing alert_id"}, status_code=400)
+    if disposition not in valid_dispositions:
+        return JSONResponse(
+            content={"error": f"Invalid disposition. Must be one of: {sorted(valid_dispositions)}"},
+            status_code=400,
+        )
+    if disposition == "other" and not notes:
+        return JSONResponse(content={"error": "Notes required when disposition is 'other'"}, status_code=400)
+
+    existing = await incident_store.get_incident(alert_id)
+    if not existing:
+        return JSONResponse(content={"error": "Incident not found."}, status_code=400)
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+
+    # Calculate MTTR
+    mttr_seconds = None
+    alert_ts = existing.get("alert_timestamp", "")
+    if alert_ts:
+        try:
+            if alert_ts.endswith("Z"):
+                alert_dt = datetime.fromisoformat(alert_ts.replace("Z", "+00:00"))
+            else:
+                alert_dt = datetime.fromisoformat(alert_ts)
+            if alert_dt.tzinfo is None:
+                alert_dt = alert_dt.replace(tzinfo=timezone.utc)
+            mttr_seconds = (now - alert_dt).total_seconds()
+        except Exception:
+            pass
+
+    label = disposition.replace("_", " ").title()  # "false_positive" -> "False Positive"
+    resolution_notes = f"{label}" + (f" — {notes}" if notes else "")
+
+    await incident_store.update_incident(
+        alert_id,
+        {
+            "status": "closed",
+            "closed_at": now_iso,
+            "closed_by": analyst,
+            "disposition": disposition,
+            "resolution_notes": resolution_notes,
+            "mttr_seconds": mttr_seconds,
+        },
+        action_log={
+            "action": "closed_with_disposition",
+            "timestamp": now_iso,
+            "actor": analyst,
+            "details": f"Disposition: {label}" + (f" | Notes: {notes}" if notes else ""),
+        },
+    )
+
+    return JSONResponse(content={
+        "incident_id": existing.get("incident_id"),
+        "status": "closed",
+        "disposition": disposition,
+        "closed_at": now_iso,
+        "mttr_seconds": mttr_seconds,
+        "mttr_minutes": int(mttr_seconds / 60) if mttr_seconds else None,
     })
 
 
